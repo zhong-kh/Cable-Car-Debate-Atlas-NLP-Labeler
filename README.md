@@ -112,4 +112,4 @@ These are primary research papers or official tool docs. The mobility-participat
 - The current project classifier is multi-label; the human interface stores one project per annotation row so that two targets can receive different scores.
 - Support is the text's expressed position, not a population approval percentage. News volume and platform coverage are not representative polling data.
 - Automatic argument abstraction is not generated yet; this version captures the evidence and gold paraphrases needed to train or prompt it responsibly.
-- This is a local single-user workbench. If multiple annotators need simultaneous access, move the database to a managed service and add user authentication/audit rules before deployment.
+- A single server instance can serve multiple annotators; Gradio serializes save callbacks and they share the server's SQLite database. It does not provide per-user accounts, roles, or conflict merging across multiple server instances. Use HTTPS, authentication and a firewall, and keep a separate database backup.
