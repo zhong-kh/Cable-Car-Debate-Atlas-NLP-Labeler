@@ -148,6 +148,14 @@ def train_models(
     argument_rows: list[dict[str, Any]],
     project_names: dict[str, str],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
+    # AI prelabels marked for review are useful as annotation drafts, but must
+    # not silently become training gold before a person accepts them.
+    annotations = [row for row in annotations if not bool(row.get("needs_review", 0))]
+    eligible_pairs = {(str(row["mention_id"]), str(row["project_id"])) for row in annotations}
+    argument_rows = [
+        row for row in argument_rows
+        if (str(row["mention_id"]), str(row["project_id"])) in eligible_pairs
+    ]
     by_id = {str(r["mention_id"]): r for r in records}
     project_labels: dict[str, set[str]] = {}
     for row in annotations:
