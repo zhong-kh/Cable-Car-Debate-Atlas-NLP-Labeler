@@ -18,6 +18,9 @@ PROJECTS = [
     ("heilbronn_cable_car", "Heilbronn Cable Car", 0),
     ("bonn_cable_car", "Bonn Cable Car", 0),
     ("passau_oberhaus_cable_car", "Passau Oberhaus Cable Car", 0),
+    ("stuttgart_urban_cable_car", "Stuttgart Urban Cable Car Proposal", 0),
+    ("stuttgart_waldfriedhof_funicular", "Stuttgart Waldfriedhof Funicular (existing)", 0),
+    ("paris_cable_c1", "Paris Câble C1", 0),
     ("__general__", "General cable-car topic / no single project", 1),
     ("__other_named__", "Other named cable-car project (enter its name)", 1),
     ("__unclear__", "Unclear project / needs review", 1),
@@ -126,6 +129,20 @@ def initialize() -> None:
                 summary_json TEXT NOT NULL,
                 PRIMARY KEY(dataset_key, model_version)
             );
+            CREATE TABLE IF NOT EXISTS imported_messages (
+                dataset_key TEXT NOT NULL,
+                mention_id TEXT NOT NULL,
+                record_json TEXT NOT NULL,
+                PRIMARY KEY(dataset_key, mention_id)
+            );
+            CREATE TABLE IF NOT EXISTS keyword_labels (
+                dataset_key TEXT NOT NULL,
+                mention_id TEXT NOT NULL,
+                rule_version TEXT NOT NULL,
+                result_json TEXT NOT NULL,
+                needs_review INTEGER NOT NULL,
+                PRIMARY KEY(dataset_key, mention_id)
+            );
             """
         )
         for project_id, name, special in PROJECTS:
@@ -221,8 +238,39 @@ def get_arguments_for_annotation(dataset_key: str, mention_id: str, project_id: 
 
 
 def save_annotation(data: dict[str, Any], arguments: list[dict[str, Any]]) -> None:
-    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    now = datetime.now(timezone.utc).isoformat(timespec="microseconds")
     with db_session() as con:
+        if data.get("replace_rule_seed"):
+            con.execute("BEGIN IMMEDIATE")
+            original = data.get("original_project_id")
+            key = (data["dataset_key"], data["mention_id"], original or data["project_id"])
+            current = con.execute(
+                """SELECT updated_at FROM annotations WHERE dataset_key=? AND mention_id=? AND project_id=?
+                   AND annotator<>'codex_rule_prelabel_v1'""", key,
+            ).fetchone()
+            if (current[0] if current else None) != data.get("expected_updated_at"):
+                raise ValueError("This label changed since you opened it. Reload the queue before saving.")
+        if data.get("replace_rule_seed"):
+            key = (data["dataset_key"], data["mention_id"])
+            con.execute(
+                """DELETE FROM argument_labels WHERE dataset_key=? AND mention_id=? AND project_id IN (
+                       SELECT project_id FROM annotations WHERE dataset_key=? AND mention_id=?
+                       AND annotator='codex_rule_prelabel_v1')""", (*key, *key),
+            )
+            con.execute(
+                """DELETE FROM annotations WHERE dataset_key=? AND mention_id=?
+                   AND annotator='codex_rule_prelabel_v1'""", key,
+            )
+        old_project = data.get("original_project_id")
+        if old_project and old_project != data["project_id"]:
+            if con.execute(
+                "SELECT 1 FROM annotations WHERE dataset_key=? AND mention_id=? AND project_id=?",
+                (data["dataset_key"], data["mention_id"], data["project_id"]),
+            ).fetchone():
+                raise ValueError("This project already has a saved label. Select it in the editing menu.")
+            key = (data["dataset_key"], data["mention_id"], old_project)
+            con.execute("DELETE FROM argument_labels WHERE dataset_key=? AND mention_id=? AND project_id=?", key)
+            con.execute("DELETE FROM annotations WHERE dataset_key=? AND mention_id=? AND project_id=?", key)
         con.execute(
             """INSERT INTO annotations(
                 dataset_key, mention_id, project_id, relevance, stance_status, support_score,
@@ -268,10 +316,15 @@ def annotation_overview(dataset_key: str) -> tuple[set[str], set[str], int]:
 def get_training_data(dataset_key: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     with db_session() as con:
         annotations = [dict(r) for r in con.execute(
-            "SELECT * FROM annotations WHERE dataset_key=? ORDER BY mention_id, project_id", (dataset_key,)
+            """SELECT * FROM annotations WHERE dataset_key=? AND needs_review=0
+               AND annotator <> 'codex_rule_prelabel_v1' ORDER BY mention_id, project_id""", (dataset_key,)
         )]
         arguments = [dict(r) for r in con.execute(
-            "SELECT * FROM argument_labels WHERE dataset_key=? ORDER BY mention_id, project_id, class_code", (dataset_key,)
+            """SELECT l.* FROM argument_labels l
+               JOIN annotations a USING(dataset_key, mention_id, project_id)
+               WHERE l.dataset_key=? AND a.needs_review=0 AND a.annotator <> 'codex_rule_prelabel_v1'
+               ORDER BY l.mention_id, l.project_id, l.class_code""",
+            (dataset_key,),
         )]
     return annotations, arguments
 

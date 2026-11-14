@@ -1,6 +1,14 @@
 # Cable Car Debate Atlas — Labeling Workbench
 
-This is a local Gradio app for building a human-reviewed training dataset from the supplied media-monitoring JSON. It shows each message's title and content, stores labels in SQLite, exports CSV/JSONL, and trains a first-pass model to suggest labels for the remaining records.
+The Gradio app combines a dashboard, the manual labeler, and crawler import using `data/annotations.sqlite3`.
+
+- **Overview** shows the percentage of labeled messages that mention each project and argument, plus average support score by project over time and by media type. The score charts show sample sizes and use only rows with a valid 0–5 score. Select a project, label source, and monthly or quarterly grouping.
+- **Manual labeling** opens the **Needs review** queue, with newly imported messages first. Missing or ambiguous keyword results are queued here. Read the original text, choose a project, select any arguments and record the stance. Use a status without a score where appropriate. Saving refreshes the charts. Clear the review flag when the label is confirmed.
+- **Crawler import** accepts uploaded JSON. The app also checks `../Crawler/heilbronn_cable_car_data.json` every 15 seconds. To use a different local path, set `LABELER_CRAWLER_IMPORT_PATH` to a JSON file or a directory of JSON files. Use the same destination for the crawler's `--output` option, or transfer its file there when the crawler runs on a different computer.
+
+Keyword rules look for a project and German, French or English argument terms in the context of a cable car mention. Score rules require an explicit stance. Dashboard totals use the confirmed human labels where available and otherwise use matched keyword labels. Review flags and source filters help distinguish those outputs from human judgments. Only confirmed human rows are eligible for the existing training tool.
+
+The original dataset establishes the existing dataset key. Keep that source file in place or set `LABELER_SOURCE_PATH` to the same JSON on the server. Imported message text and keyword results are stored in SQLite and survive restart. Reimporting skips matching records and canonical article URLs. Syndicated stories at unrelated URLs may still appear separately. The SQLite backup includes the imported rows and labels.
 
 ## Start the dashboard
 
@@ -34,6 +42,42 @@ python app.py
 Use a TLS reverse proxy (for example Caddy or Nginx with HTTPS) and firewall the Gradio port so it is not exposed as plain HTTP. Do not commit credentials or the SQLite database. If the server is behind an authenticated reverse proxy, keep the Gradio port private to localhost and configure the proxy to require HTTPS and authentication.
 
 At the end of annotation, use **Create SQLite backup** in the Progress & export tab, then SFTP-download the generated `annotations_backup_*.sqlite3` from `data/exports/`. This uses SQLite's backup API to create a consistent snapshot even when WAL journaling is enabled. Also download the original source JSON and any CSV/JSONL exports you need. The backup and export folder are git-ignored.
+
+## Provisional 1,000-message seed
+
+`weak_label_seed.py` can add a deterministic, rule-based set of 1,000 **provisional** annotations to the same `data/annotations.sqlite3` used by `app.py`. The current seed includes all currently unannotated Heilbronn + cable-car-keyword candidates, Stuttgart + cable-car-keyword candidates, a sample of French-language cable-car-keyword messages, and a smaller multilingual remainder. Its manifest is saved to `data/exports/weak_label_seed_1000_20261114.csv`.
+
+These are not human-confirmed labels: every row is stored with `needs_review=1`, an annotator/source note, and should be checked in the **Needs review** queue. The training data loader excludes rows with `needs_review=1`, so they cannot enter model training until a person verifies and saves them with the review flag cleared. Source `sentiment` is not used as a support-score label. Before using a different dataset, inspect and update the seed rules; city names and language alone do not identify a project or an argument.
+
+The message queue includes **French (all variants)** and **German (all variants)** language filters. Use the search box with `Heilbronn` or `Stuttgart` and the **Needs review** queue to inspect the corresponding keyword candidates.
+
+## Review model predictions
+
+Start the separate audit dashboard from the same environment:
+
+```bash
+python audit_app.py
+```
+
+Open `http://127.0.0.1:7862`, choose the **Predictions SQLite** file, and provide the matching source dataset path. The default path points to the supplied Heilbronn JSON; the SQLite file contains predictions and labels, but not the original message text. You can also upload a smaller JSON/CSV/TSV source file.
+
+Choose Project Index, Support Score, or Argument Type(s), then draw a simple random sample. The default sampling pool excludes messages already annotated and predictions marked as training examples. For each item, the dashboard shows title, full content, source metadata, prediction JSON and confidence. Enter your human project, score/status, or argument class/direction labels, check the confirmation box, and save. Use **Include training / previously annotated messages** only to inspect training fit; reports from that batch are marked diagnostic-only.
+
+Each batch is saved locally and can be resumed by its batch ID after reloading the same prediction and source files. **Save** keeps you on the current message; **Save & next** advances; **Next without saving** skips it. To revise a saved human judgment, return with **Previous without saving**, change the labels, and save again—the latest judgment replaces the earlier one in the audit database.
+
+Blind validation is on by default: it hides the model output until you save your human label, reducing anchoring. Turn it off only for quick side-by-side inspection.
+
+Human reviews go into the separate `data/audit_reviews.sqlite3`; the selected Predictions SQLite and `data/annotations.sqlite3` are not modified. Export produces a Markdown report and a row-level CSV under `data/exports/`. The report records the model and input file hashes, sampling seed and population, completed-review coverage, task-specific metrics, and a 95% Wilson interval for exact agreement. Review all sampled rows where possible; selective skipping can bias the estimate.
+
+The audit app binds only to localhost by default. To expose it through a protected server, set `AUDIT_HOST`, `AUDIT_PORT`, `AUDIT_USERNAME`, and `AUDIT_PASSWORD`, then put it behind HTTPS and firewall the Gradio port:
+
+```bash
+AUDIT_HOST=127.0.0.1 AUDIT_PORT=7862 \
+AUDIT_USERNAME='team-user' AUDIT_PASSWORD='use-a-long-secret' \
+python audit_app.py
+```
+
+For a reverse proxy, keep the app bound to `127.0.0.1` and proxy to port `7862`. The audit database and exports are git-ignored.
 
 ## What is stored
 
