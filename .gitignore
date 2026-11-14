@@ -1,8 +1,28 @@
+# Python
 .venv/
 __pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+
+# User datasets, annotations, crawler snapshots and exports
 data/*.sqlite3
 data/*.sqlite3-shm
 data/*.sqlite3-wal
+data/imports/
+data/incoming/
 data/exports/
+data/predictions/
+data/.DS_Store
+
+# Trained model artifacts
 models/*.joblib
 models/*-latest.json
+
+# OS metadata
+.DS_Store

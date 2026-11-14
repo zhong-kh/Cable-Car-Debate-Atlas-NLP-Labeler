@@ -1,35 +1,103 @@
-# Cable Car Debate Atlas — Labeling Workbench
+# Seilbahn
 
-The Gradio app combines a dashboard, the manual labeler, and crawler import using `data/annotations.sqlite3`.
+**Seilbahn** is a collaborative dashboard for exploring cable-car project discussions, reviewing message labels, and tracking how arguments and expressed support change over time. It combines the existing labeling workbench with keyword-assisted imports, an optional local crawler, charts, model tools, and dataset export.
 
-- **Overview** shows the percentage of labeled messages that mention each project and argument, plus average support score by project over time and by media type. The score charts show sample sizes and use only rows with a valid 0–5 score. Select a project, label source, and monthly or quarterly grouping.
-- **Manual labeling** opens the **Needs review** queue, with newly imported messages first. Missing or ambiguous keyword results are queued here. Read the original text, choose a project, select any arguments and record the stance. Use a status without a score where appropriate. Saving refreshes the charts. Clear the review flag when the label is confirmed.
-- **Crawler import** accepts uploaded JSON. The app also checks `../Crawler/heilbronn_cable_car_data.json` every 15 seconds. To use a different local path, set `LABELER_CRAWLER_IMPORT_PATH` to a JSON file or a directory of JSON files. Use the same destination for the crawler's `--output` option, or transfer its file there when the crawler runs on a different computer.
+## What it does
 
-Keyword rules look for a project and German, French or English argument terms in the context of a cable car mention. Score rules require an explicit stance. Dashboard totals use the confirmed human labels where available and otherwise use matched keyword labels. Review flags and source filters help distinguish those outputs from human judgments. Only confirmed human rows are eligible for the existing training tool.
+- Shows project and argument coverage, support scores over time, and differences by source/media type.
+- Imports crawler-format JSON datasets and adds one-off records through a form.
+- Assigns conservative project, argument, and support suggestions with multilingual keyword rules. Ambiguous items go to **Manual labeling → Needs review**.
+- Runs the bundled Heilbronn crawler in the background while the web app is running. It runs once at startup and then on a configurable interval.
+- Saves records, labels, keyword results, and removal history in SQLite. Imported records therefore survive an app restart.
+- Lets reviewers remove empty or irrelevant messages from the active dataset and restore them later.
+- Exports labels, arguments, RAG-friendly JSONL, a combined active JSON dataset, and a consistent SQLite backup.
+- Includes a local TF-IDF model baseline and a separate prediction-review utility.
 
-The original dataset establishes the existing dataset key. Keep that source file in place or set `LABELER_SOURCE_PATH` to the same JSON on the server. Imported message text and keyword results are stored in SQLite and survive restart. Reimporting skips matching records and canonical article URLs. Syndicated stories at unrelated URLs may still appear separately. The SQLite backup includes the imported rows and labels.
+Keyword labels are rule-based suggestions, not verified public-opinion measurements. They are shown separately from human-confirmed labels. The support score describes the position expressed in a message; it is not a representative poll of the population.
 
-## Start the dashboard
+## Repository layout
 
-From a terminal:
+```text
+Seilbahn/
+├── app.py                      # Main Gradio dashboard
+├── store.py                    # SQLite schema and persistence
+├── workflow.py                 # Import, deduplication and keyword-label flow
+├── keyword_labels.py           # Conservative multilingual rules
+├── dashboard_charts.py         # Plotly figures
+├── model_pipeline.py           # Local TF-IDF training and predictions
+├── crawler/
+│   └── scraper.py              # Bundled Heilbronn news and public-source crawler
+├── tools/
+│   ├── review_predictions.py   # Separate blind prediction-audit UI
+│   └── seed_provisional_labels.py # Optional legacy rule-based seed utility
+├── data/                       # Created locally; database and data are ignored by Git
+├── models/                     # Local model artifacts; ignored by Git
+├── requirements.txt
+└── .env.example
+```
+
+The source corpus, SQLite databases, crawler snapshots, imports, exports, credentials, and trained model files are intentionally excluded from Git. Each team should provide its own data and keep its database backed up.
+
+## Quick start
+
+Use Python 3.10 or newer.
 
 ```bash
-cd Cable-Car-Debate-Atlas-NLP-Labeler
-python --version  # use Python 3.9 or newer
-python -m venv .venv
+git clone <repository-url> Seilbahn
+cd Seilbahn
+python3 -m venv .venv
 source .venv/bin/activate
+python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 python app.py
 ```
 
-The app runs locally at `http://127.0.0.1:7861`; sharing is disabled. It automatically finds the supplied file under `Participants - Future City Hackathon/Stadt Heilbronn/` when this project folder is in its current location. To point it to another JSON/CSV/TSV dataset, edit `find_default_dataset()` in `app.py`; it expects at least `title` and `content` fields.
+Open <http://127.0.0.1:7861>. The app can start without the original source corpus. Import a JSON dataset in **Datasets & crawler**, or set `LABELER_SOURCE_PATH` before starting the app. If the original source is available next to the repository in `../Participants - Future City Hackathon/Stadt Heilbronn/`, the app will find the Heilbronn JSON automatically on its first run.
+
+For local settings, copy the example and export its values into the shell before starting the app:
+
+```bash
+cp .env.example .env
+set -a
+source ./.env
+set +a
+python app.py
+```
+
+Python does not load `.env` automatically; the shell commands above do. `.env` is git-ignored.
+
+## Dataset format and importing
+
+Upload a JSON array whose entries follow the crawler's message format. The app accepts these standard fields:
+
+```json
+[
+  {
+    "mention_id": "source:123",
+    "title": "Example title",
+    "published_at": "2026-11-14T10:00:00+01:00",
+    "media_type_name": "news_article",
+    "source_name": "Example source",
+    "language_code": "de",
+    "url": "https://example.org/article",
+    "content": "Full message or article text"
+  }
+]
+```
+
+Crawler aliases `timestamp`, `media_type`, `source`, and `language` are accepted as well. In **Datasets & crawler**, upload JSON to append its records, or use **Add one record manually**. New items pass through the same deduplication and keyword-label pipeline. The app skips blank records and known duplicates. When imported rows need review, the dashboard opens the **Manual labeling** queue automatically. Use **Progress & export → Export active dataset JSON** to download the current combined dataset in crawler-compatible format.
+
+Imported records are stored in `data/annotations.sqlite3`; uploaded source files and manual-entry snapshots are also kept under the ignored `data/imports/` folder. A stable workspace dataset key lets a server continue using the same label set when the original JSON file is not mounted.
+
+## Crawler behavior
+
+The included crawler checks recent Heilbronn cable-car coverage from SWR, the City of Heilbronn, and Google News search feeds. The app runs it once at startup and repeats it every six hours by default. Each completed snapshot is written atomically to `data/incoming/heilbronn_cable_car_data.json`; the app imports new records and skips duplicates. Crawling and imports use the same local environment and database as the dashboard.
+
+To change the interval, set `SEILBAHN_CRAWL_INTERVAL_SECONDS` (minimum five minutes). To disable scheduled crawler runs while retaining manual JSON import, set `SEILBAHN_DISABLE_CRAWLER=1`. You can also press **Run crawler now**. If crawler packages are missing, install the root `requirements.txt`; the dashboard still starts and displays the crawler error. For a crawler running on a different machine, set `LABELER_CRAWLER_IMPORT_PATH` to a JSON file or a directory of JSON snapshots; the dashboard polls it automatically.
 
 ## Run on a team server
 
-The app serializes label/save requests through Gradio's queue and stores them in one SQLite database on the server. All annotators visiting the same server instance therefore see the same label progress. Keep the source JSON at the same relative location next to the cloned `NLP_Labeler` folder, or update `find_default_dataset()` for the server's dataset path. The source dataset is intentionally not part of this code repository.
-
-For direct network binding, set a username and password and listen on the server interface:
+Run one app process with one shared local SQLite database. Keep the app bound to localhost behind a TLS reverse proxy when possible. For direct binding to a private network, configure a username and password and firewall the port:
 
 ```bash
 LABELER_HOST=0.0.0.0 \
@@ -39,121 +107,34 @@ LABELER_PASSWORD='use-a-long-secret' \
 python app.py
 ```
 
-Use a TLS reverse proxy (for example Caddy or Nginx with HTTPS) and firewall the Gradio port so it is not exposed as plain HTTP. Do not commit credentials or the SQLite database. If the server is behind an authenticated reverse proxy, keep the Gradio port private to localhost and configure the proxy to require HTTPS and authentication.
+Do not expose plain HTTP to the public internet. The built-in login is basic access protection; use HTTPS and a firewall or an authenticated reverse proxy. Do not run multiple app processes against the same SQLite file. The app queue serializes writes for collaborators using one server instance.
 
-At the end of annotation, use **Create SQLite backup** in the Progress & export tab, then SFTP-download the generated `annotations_backup_*.sqlite3` from `data/exports/`. This uses SQLite's backup API to create a consistent snapshot even when WAL journaling is enabled. Also download the original source JSON and any CSV/JSONL exports you need. The backup and export folder are git-ignored.
+## Label-review workflow
 
-## Provisional 1,000-message seed
+1. Open **Overview** to inspect the current charts and pending review count.
+2. Open **Manual labeling** and load **Needs review**. Newly imported items with missing or ambiguous rule labels appear here.
+3. Select project, support-status/score, and all applicable argument classes. Save labels as confirmed or flag them for another reviewer.
+4. For empty, duplicate, or irrelevant rows, open **Remove an empty or irrelevant message**, enter an optional reason, check the confirmation box, and remove it. Removal hides the row and its labels from active charts, queues, training, and exports; the **Progress & export** tab can restore it.
+5. Use **Progress & export** to download the combined dataset and SQLite backup.
 
-`weak_label_seed.py` can add a deterministic, rule-based set of 1,000 **provisional** annotations to the same `data/annotations.sqlite3` used by `app.py`. The current seed includes all currently unannotated Heilbronn + cable-car-keyword candidates, Stuttgart + cable-car-keyword candidates, a sample of French-language cable-car-keyword messages, and a smaller multilingual remainder. Its manifest is saved to `data/exports/weak_label_seed_1000_20261114.csv`.
+The app saves human labels by message and project. If a message discusses more than one project, save one project label and then add the next project using the saved-label selector. Argument labels are multi-label. In this version the selected argument classes share the same direction and evidence/abstraction fields for each save.
 
-These are not human-confirmed labels: every row is stored with `needs_review=1`, an annotator/source note, and should be checked in the **Needs review** queue. The training data loader excludes rows with `needs_review=1`, so they cannot enter model training until a person verifies and saves them with the review flag cleared. Source `sentiment` is not used as a support-score label. Before using a different dataset, inspect and update the seed rules; city names and language alone do not identify a project or an argument.
+## Models and optional tools
 
-The message queue includes **French (all variants)** and **German (all variants)** language filters. Use the search box with `Heilbronn` or `Stuttgart` and the **Needs review** queue to inspect the corresponding keyword candidates.
+The in-app baseline uses local word and character TF-IDF features with scikit-learn. It needs human-reviewed examples and a held-out evaluation set before its predictions should be treated as reliable. Keyword suggestions are excluded from model training unless a human reviews and confirms them.
 
-## Review model predictions
-
-Start the separate audit dashboard from the same environment:
-
-```bash
-python audit_app.py
-```
-
-Open `http://127.0.0.1:7862`, choose the **Predictions SQLite** file, and provide the matching source dataset path. The default path points to the supplied Heilbronn JSON; the SQLite file contains predictions and labels, but not the original message text. You can also upload a smaller JSON/CSV/TSV source file.
-
-Choose Project Index, Support Score, or Argument Type(s), then draw a simple random sample. The default sampling pool excludes messages already annotated and predictions marked as training examples. For each item, the dashboard shows title, full content, source metadata, prediction JSON and confidence. Enter your human project, score/status, or argument class/direction labels, check the confirmation box, and save. Use **Include training / previously annotated messages** only to inspect training fit; reports from that batch are marked diagnostic-only.
-
-Each batch is saved locally and can be resumed by its batch ID after reloading the same prediction and source files. **Save** keeps you on the current message; **Save & next** advances; **Next without saving** skips it. To revise a saved human judgment, return with **Previous without saving**, change the labels, and save again—the latest judgment replaces the earlier one in the audit database.
-
-Blind validation is on by default: it hides the model output until you save your human label, reducing anchoring. Turn it off only for quick side-by-side inspection.
-
-Human reviews go into the separate `data/audit_reviews.sqlite3`; the selected Predictions SQLite and `data/annotations.sqlite3` are not modified. Export produces a Markdown report and a row-level CSV under `data/exports/`. The report records the model and input file hashes, sampling seed and population, completed-review coverage, task-specific metrics, and a 95% Wilson interval for exact agreement. Review all sampled rows where possible; selective skipping can bias the estimate.
-
-The audit app binds only to localhost by default. To expose it through a protected server, set `AUDIT_HOST`, `AUDIT_PORT`, `AUDIT_USERNAME`, and `AUDIT_PASSWORD`, then put it behind HTTPS and firewall the Gradio port:
+The prediction-audit UI can be started separately when inspecting a predictions SQLite file:
 
 ```bash
-AUDIT_HOST=127.0.0.1 AUDIT_PORT=7862 \
-AUDIT_USERNAME='team-user' AUDIT_PASSWORD='use-a-long-secret' \
-python audit_app.py
+python tools/review_predictions.py
 ```
 
-For a reverse proxy, keep the app bound to `127.0.0.1` and proxy to port `7862`. The audit database and exports are git-ignored.
+It writes human audit labels to a separate local database. `tools/seed_provisional_labels.py` is a legacy utility for creating provisional rule-based seed rows from the supplied Heilbronn source file; those rows are review-only. Neither tool is needed to run the main Seilbahn dashboard.
 
-## What is stored
+## Back up and move the dataset
 
-- Human annotations: `data/annotations.sqlite3`
-- Local model files: `models/`
-- The original 200 MB JSON remains the source of text; its full contents are not copied into SQLite.
-- Each saved row identifies a `mention_id × project_id`. To annotate a message about two projects, save one project row and then save the other.
-- Argument labels are stored as separate `mention_id × project_id × argument_type` records, including direction, an optional verbatim evidence quote, and an optional short abstraction. In this first UI, the same direction/quote/abstraction is applied to all categories selected in one save; select together only categories that share that context.
-- Model suggestions are stored separately from human annotations and never overwrite them.
+Use **Create SQLite backup** before downloading or transferring the database. It includes SQLite's committed WAL contents. Save the original corpus separately if it is still needed; uploaded records are included in the database and in the combined JSON export. Keep the backup and exports out of Git and transfer them securely (for example, over SFTP).
 
-Back up the SQLite file together with the source dataset. CSV and RAG-friendly JSONL snapshots are available from the **Progress & export** tab.
+## Configuration
 
-## Annotation scale
-
-The numeric scale means:
-
-| Score | Meaning |
-|---:|---|
-| 0 | Strongly opposes |
-| 1 | Opposes |
-| 2 | Leans against |
-| 3 | Leans in favor |
-| 4 | Supports |
-| 5 | Strongly supports |
-
-Neutral, mixed/conditional, no expressed position and unclear are separate statuses without a numeric score. This prevents the model from inventing a neutral position on a scale that has no neutral value.
-
-Argument types are multi-label. Their direction is recorded relative to the selected cable-car proposal. The current form applies one shared direction and one shared evidence/abstraction note to the selected categories in a save. These fields make later argument abstraction auditable.
-
-## How the training pipeline works
-
-### First baseline (available in the app)
-
-The dashboard's first model is deliberately simple and fully local:
-
-1. **Project Index:** a multi-label classifier predicts one or more named projects. General cable-car discussion and unrelated posts that a human explicitly labels are negative examples. Add any new concrete project through the project index before labeling it.
-2. **Argument Type + direction:** a multi-label classifier predicts combinations such as `cost_finance::con` or `economic_development::pro`. It sees the target project name as part of its input.
-3. **Support Score:** a cumulative ordinal classifier predicts the five thresholds `score ≥ 1` … `score ≥ 5`, then reconstructs probabilities for levels 0–5. This respects the ordering between score levels better than treating 0–5 as unrelated categories.
-4. **Predict remaining records:** project candidates are predicted first; argument and support suggestions are then conditioned on each predicted project. The app writes these predictions to the predictions table and flags low-confidence cases for review. Human annotations remain untouched.
-
-Models use word and character TF-IDF features with scikit-learn Logistic Regression. Character features are a useful fast baseline for German/French spellings, inflections and names. It needs no API key and no pretrained checkpoint download. The app uses the entire `Title + Content` string, capped at 30,000 characters for model computation; the full original text remains visible and is exported intact.
-
-The current baseline does **not** claim validated accuracy. Raw Logistic Regression probabilities are not calibrated confidence. The prediction threshold controls which suggestions are flagged for review; tune it against a human-labeled validation set before presenting predictions as reliable.
-
-### Recommended model progression
-
-**Phase 1 — collect labels:** start with a diverse pilot across German/French, named projects, media types, years, clear/unclear position, and argument classes. Double-label at least 20–25% and adjudicate differences. Do not label all first examples from the same news source or duplicate story.
-
-**Phase 2 — train the baseline:** use the dashboard button after there are reviewed examples from multiple projects or explicit general/unrelated negatives, at least two examples for each argument-class/direction pair, and more than one scored support level. Early models are for queue triage, not unattended publishing.
-
-**Phase 3 — evaluate before relying on it:** reserve a human-labeled validation set from different URLs/sources, preferably from a later time period. Report project-level and language-level precision/recall/F1; argument-level macro-F1 and per-class precision/recall; and support-score MAE plus quadratic weighted kappa. Keep challenging and rare examples in the evaluation set. This dashboard version does not yet calculate formal holdout metrics, so the team should not infer accuracy from training success.
-
-**Phase 4 — multilingual neural upgrade:** after the baseline and annotation guide are stable, compare a SetFit model using a German/French-capable sentence transformer (for example `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`) against the TF-IDF baseline. Use SetFit's multi-label head for argument categories/directions and project candidates. For support, prepend the project target and compare a target-aware 6-level classifier with a cumulative ordinal head. Retain the same held-out evaluation set for a fair comparison. This requires installing the extra `setfit` and `sentence-transformers` packages and downloading a model checkpoint.
-
-**Argument abstraction:** the app collects a short, human-written paraphrase linked to a quote. A model that generates argument summaries is a separate text-generation task; it needs examples of source text → verified evidence span → faithful abstract → class/direction. Once those pairs exist, pilot a constrained JSON/text-to-text model that cites the source span and abstains when evidence is missing. Review generated summaries for factual faithfulness and preservation of minority arguments before publication. Do not treat an automatically generated paraphrase as an independent source.
-
-## Research informing the choices
-
-These are primary research papers or official tool docs. The mobility-participation corpus is the closest task/domain match; SetFit is the candidate low-label multilingual upgrade; target-aware stance methods guide the support model; argument-mining/summarization papers inform the later abstraction phase.
-
-1. **Most domain-relevant:** Romberg, Mark & Escher (LREC 2022), [A Corpus of German Citizen Contributions in Mobility Planning](https://aclanthology.org/2022.lrec-1.308/). It covers contributions to six planning processes in five German municipalities and annotates argument recognition, argument concreteness, location and themes. It is a strong reference for our codebook and evaluation dimensions. Check license and label compatibility before reusing data.
-2. Vamvas & Sennrich (2020), [X-Stance: A Multilingual Multi-Target Dataset for Stance Detection](https://arxiv.org/abs/2003.08385). German/French/Italian comments are paired with issue targets; the paper provides a close methodological analogue for target-conditioned cable-car support scoring, with a domain-transfer caveat.
-3. Du et al. (IJCAI 2017), [Stance Classification with Target-specific Neural Attention](https://www.ijcai.org/Proceedings/2017/557). Supports conditioning stance detection on the target instead of generic sentiment.
-4. Tunstall et al. (NeurIPS 2022), [Efficient Few-Shot Learning Without Prompts (SetFit)](https://arxiv.org/abs/2209.11055). Proposes contrastive fine-tuning of sentence embeddings followed by a classification head; supports the low-label model upgrade option.
-5. Hugging Face, [SetFit multi-label classification guide](https://huggingface.co/docs/setfit/how_to/multilabel); Sentence Transformers, [multilingual pretrained model list](https://www.sbert.net/docs/sentence_transformer/pretrained_models.html). Official implementation documentation.
-6. Kawarada et al. (EACL 2024), [Argument Mining as a Text-to-Text Generation Task](https://aclanthology.org/2024.eacl-long.121/). Shows a generative route for spans, argument components and relations. Consider after the team has verified structured annotations; it is more complex than tag prediction.
-7. Syed et al. (SIGDIAL 2023), [Frame-oriented Summarization of Argumentative Discussions](https://aclanthology.org/2023.sigdial-1.10/). Relevant for aggregating many comments into frames/key points while retrieving representative arguments.
-8. Syed et al. (COLING 2020), [News Editorials: Towards Summarizing Long Argumentative Texts](https://aclanthology.org/2020.coling-main.470/). Useful for judging concise summaries of individual long opinion articles.
-9. Nadeem & Ostendorf (WASSA 2023), [Examining Bias in Opinion Summarisation through Opinion Diversity](https://aclanthology.org/2023.wassa-1.14/). Motivates reporting minority as well as majority arguments in any generated summary.
-10. Cao et al. (2020), [Rank-consistent ordinal regression (CORAL)](https://arxiv.org/abs/1901.07884). Provides a principled neural ordinal alternative if we upgrade the support-score model.
-11. Guo et al. (ICML 2017), [On Calibration of Modern Neural Networks](https://proceedings.mlr.press/v70/guo17a.html). Motivates treating confidence calibration as a separate evaluation step.
-
-## Known limits in this version
-
-- The current model is a fast baseline, not a validated production classifier. It needs domain labels, distinct positive and negative examples, and separate evaluation.
-- The current project classifier is multi-label; the human interface stores one project per annotation row so that two targets can receive different scores.
-- Support is the text's expressed position, not a population approval percentage. News volume and platform coverage are not representative polling data.
-- Automatic argument abstraction is not generated yet; this version captures the evidence and gold paraphrases needed to train or prompt it responsibly.
-- A single server instance can serve multiple annotators; Gradio serializes save callbacks and they share the server's SQLite database. It does not provide per-user accounts, roles, or conflict merging across multiple server instances. Use HTTPS, authentication and a firewall, and keep a separate database backup.
+See [.env.example](.env.example) for the supported host, port, crawler interval, source path, and credentials. The main defaults are localhost on port `7861`, automatic crawl every six hours, and the built-in source file if it is present beside the repository.

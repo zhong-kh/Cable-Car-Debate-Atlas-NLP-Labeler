@@ -1,8 +1,9 @@
-"""SQLite persistence for the local cable-car annotation workbench."""
+"""SQLite persistence for the Seilbahn dashboard."""
 
 from __future__ import annotations
 
 import re
+import json
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -143,6 +144,18 @@ def initialize() -> None:
                 needs_review INTEGER NOT NULL,
                 PRIMARY KEY(dataset_key, mention_id)
             );
+            CREATE TABLE IF NOT EXISTS deleted_messages (
+                dataset_key TEXT NOT NULL,
+                mention_id TEXT NOT NULL,
+                record_json TEXT NOT NULL,
+                reason TEXT NOT NULL DEFAULT '',
+                deleted_at TEXT NOT NULL,
+                PRIMARY KEY (dataset_key, mention_id)
+            );
+            CREATE TABLE IF NOT EXISTS workspace_settings (
+                setting_key TEXT PRIMARY KEY,
+                setting_value TEXT NOT NULL
+            );
             """
         )
         for project_id, name, special in PROJECTS:
@@ -208,6 +221,68 @@ def add_argument_class(name: str) -> str:
         return candidate
 
 
+def get_or_set_dataset_key(proposed: str) -> str:
+    """Keep a stable active dataset identity if its original source file is absent."""
+    with db_session() as con:
+        row = con.execute(
+            "SELECT setting_value FROM workspace_settings WHERE setting_key='active_dataset_key'"
+        ).fetchone()
+        if row:
+            return str(row[0])
+        candidates = {r[0] for r in con.execute(
+            "SELECT dataset_key FROM annotations UNION SELECT dataset_key FROM imported_messages"
+        )}
+        value = next(iter(candidates)) if len(candidates) == 1 else proposed
+        con.execute(
+            "INSERT INTO workspace_settings(setting_key, setting_value) VALUES('active_dataset_key', ?)",
+            (value,),
+        )
+        return value
+
+
+def deleted_message_ids(dataset_key: str) -> set[str]:
+    with db_session() as con:
+        return {str(r[0]) for r in con.execute(
+            "SELECT mention_id FROM deleted_messages WHERE dataset_key=?", (dataset_key,)
+        )}
+
+
+def get_deleted_messages(dataset_key: str) -> list[dict[str, Any]]:
+    with db_session() as con:
+        return [dict(r) for r in con.execute(
+            "SELECT * FROM deleted_messages WHERE dataset_key=? ORDER BY deleted_at DESC", (dataset_key,)
+        )]
+
+
+def delete_message(dataset_key: str, mention_id: str, record: dict[str, Any], reason: str = "") -> None:
+    """Hide a message and its labels from active views, retaining a restorable snapshot."""
+    with db_session() as con:
+        con.execute(
+            """INSERT INTO deleted_messages(dataset_key, mention_id, record_json, reason, deleted_at)
+               VALUES(?,?,?,?,?) ON CONFLICT(dataset_key, mention_id) DO UPDATE SET
+               record_json=excluded.record_json, reason=excluded.reason, deleted_at=excluded.deleted_at""",
+            (dataset_key, mention_id, json.dumps(record, ensure_ascii=False), reason.strip(),
+             datetime.now(timezone.utc).isoformat(timespec="seconds")),
+        )
+
+
+def restore_message(dataset_key: str, mention_id: str) -> dict[str, Any] | None:
+    with db_session() as con:
+        row = con.execute(
+            "SELECT record_json FROM deleted_messages WHERE dataset_key=? AND mention_id=?",
+            (dataset_key, mention_id),
+        ).fetchone()
+        if not row:
+            return None
+        record = json.loads(row[0])
+        con.execute(
+            "INSERT OR IGNORE INTO imported_messages(dataset_key, mention_id, record_json) VALUES(?,?,?)",
+            (dataset_key, mention_id, json.dumps(record, ensure_ascii=False)),
+        )
+        con.execute("DELETE FROM deleted_messages WHERE dataset_key=? AND mention_id=?", (dataset_key, mention_id))
+        return record
+
+
 def get_annotation(dataset_key: str, mention_id: str, project_id: str) -> dict[str, Any] | None:
     with db_session() as con:
         row = con.execute(
@@ -240,6 +315,11 @@ def get_arguments_for_annotation(dataset_key: str, mention_id: str, project_id: 
 def save_annotation(data: dict[str, Any], arguments: list[dict[str, Any]]) -> None:
     now = datetime.now(timezone.utc).isoformat(timespec="microseconds")
     with db_session() as con:
+        if con.execute(
+            "SELECT 1 FROM deleted_messages WHERE dataset_key=? AND mention_id=?",
+            (data["dataset_key"], data["mention_id"]),
+        ).fetchone():
+            raise ValueError("This message was removed from the active dataset. Restore it before editing labels.")
         if data.get("replace_rule_seed"):
             con.execute("BEGIN IMMEDIATE")
             original = data.get("original_project_id")
@@ -306,7 +386,10 @@ def save_annotation(data: dict[str, Any], arguments: list[dict[str, Any]]) -> No
 def annotation_overview(dataset_key: str) -> tuple[set[str], set[str], int]:
     with db_session() as con:
         rows = con.execute(
-            "SELECT mention_id, needs_review FROM annotations WHERE dataset_key=?", (dataset_key,)
+            """SELECT a.mention_id, a.needs_review FROM annotations a WHERE a.dataset_key=?
+               AND NOT EXISTS (SELECT 1 FROM deleted_messages d
+                               WHERE d.dataset_key=a.dataset_key AND d.mention_id=a.mention_id)""",
+            (dataset_key,),
         ).fetchall()
         labeled = {str(r["mention_id"]) for r in rows}
         review = {str(r["mention_id"]) for r in rows if r["needs_review"]}
@@ -316,13 +399,18 @@ def annotation_overview(dataset_key: str) -> tuple[set[str], set[str], int]:
 def get_training_data(dataset_key: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     with db_session() as con:
         annotations = [dict(r) for r in con.execute(
-            """SELECT * FROM annotations WHERE dataset_key=? AND needs_review=0
-               AND annotator <> 'codex_rule_prelabel_v1' ORDER BY mention_id, project_id""", (dataset_key,)
+            """SELECT a.* FROM annotations a WHERE a.dataset_key=? AND a.needs_review=0
+               AND a.annotator <> 'codex_rule_prelabel_v1'
+               AND NOT EXISTS (SELECT 1 FROM deleted_messages d
+                               WHERE d.dataset_key=a.dataset_key AND d.mention_id=a.mention_id)
+               ORDER BY a.mention_id, a.project_id""", (dataset_key,)
         )]
         arguments = [dict(r) for r in con.execute(
             """SELECT l.* FROM argument_labels l
                JOIN annotations a USING(dataset_key, mention_id, project_id)
                WHERE l.dataset_key=? AND a.needs_review=0 AND a.annotator <> 'codex_rule_prelabel_v1'
+               AND NOT EXISTS (SELECT 1 FROM deleted_messages d
+                               WHERE d.dataset_key=l.dataset_key AND d.mention_id=l.mention_id)
                ORDER BY l.mention_id, l.project_id, l.class_code""",
             (dataset_key,),
         )]
@@ -365,7 +453,10 @@ def predictions_for_message(dataset_key: str, mention_id: str) -> list[dict[str,
 def prediction_rows(dataset_key: str) -> list[dict[str, Any]]:
     with db_session() as con:
         return [dict(r) for r in con.execute(
-            "SELECT * FROM predictions WHERE dataset_key=? ORDER BY mention_id, task, project_id",
+            """SELECT p.* FROM predictions p WHERE p.dataset_key=?
+               AND NOT EXISTS (SELECT 1 FROM deleted_messages d
+                               WHERE d.dataset_key=p.dataset_key AND d.mention_id=p.mention_id)
+               ORDER BY p.mention_id, p.task, p.project_id""",
             (dataset_key,),
         )]
 
@@ -385,12 +476,16 @@ def export_rows(dataset_key: str) -> tuple[list[dict[str, Any]], list[dict[str, 
     with db_session() as con:
         labels = [dict(r) for r in con.execute(
             """SELECT a.*, p.project_name FROM annotations a JOIN projects p USING(project_id)
-               WHERE dataset_key=? ORDER BY mention_id, project_id""", (dataset_key,)
+               WHERE a.dataset_key=? AND NOT EXISTS (SELECT 1 FROM deleted_messages d
+                   WHERE d.dataset_key=a.dataset_key AND d.mention_id=a.mention_id)
+               ORDER BY a.mention_id, a.project_id""", (dataset_key,)
         )]
         args = [dict(r) for r in con.execute(
             """SELECT al.*, ac.class_name, p.project_name FROM argument_labels al
                JOIN argument_classes ac USING(class_code) JOIN projects p USING(project_id)
-               WHERE dataset_key=? ORDER BY mention_id, project_id, class_code""", (dataset_key,)
+               WHERE al.dataset_key=? AND NOT EXISTS (SELECT 1 FROM deleted_messages d
+                   WHERE d.dataset_key=al.dataset_key AND d.mention_id=al.mention_id)
+               ORDER BY al.mention_id, al.project_id, al.class_code""", (dataset_key,)
         )]
     return labels, args
 

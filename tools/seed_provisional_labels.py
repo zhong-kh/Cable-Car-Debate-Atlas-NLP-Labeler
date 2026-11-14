@@ -22,10 +22,12 @@ from html import unescape
 from pathlib import Path
 from typing import Any
 
+APP_DIR = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(APP_DIR))
+
 import store
 
 
-APP_DIR = Path(__file__).resolve().parent
 SOURCE = APP_DIR.parent / "Participants - Future City Hackathon" / "Stadt Heilbronn" / "FSI_Heilbronn_Medienbeiträge (1).json"
 OUT = APP_DIR / "data" / "exports"
 SEED = 20261114

@@ -23,7 +23,7 @@ from typing import Any
 import gradio as gr
 
 
-APP_DIR = Path(__file__).resolve().parent
+APP_DIR = Path(__file__).resolve().parents[1]
 ROOT_DIR = APP_DIR.parent
 DATA_DIR = APP_DIR / "data"
 AUDIT_DB = DATA_DIR / "audit_reviews.sqlite3"

@@ -6,11 +6,15 @@ import io
 import json
 import logging
 import os
+import shutil
+import subprocess
+import sys
+import uuid
 from collections import Counter
 from datetime import datetime
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-from threading import Event, Thread
+from threading import Event, Lock, Thread
 from typing import Any
 
 import gradio as gr
@@ -25,6 +29,9 @@ from workflow import LEGACY, Workflow
 APP_DIR = Path(__file__).resolve().parent
 ROOT_DIR = APP_DIR.parent
 EXPORT_DIR = APP_DIR / "data" / "exports"
+IMPORT_DIR = APP_DIR / "data" / "imports"
+CRAWLER_OUTPUT = APP_DIR / "data" / "incoming" / "heilbronn_cable_car_data.json"
+CRAWLER_SCRIPT = APP_DIR / "crawler" / "scraper.py"
 SCORE_LABELS = [
     ("0 · Strongly oppose", 0),
     ("1 · Oppose", 1),
@@ -344,6 +351,7 @@ def current_progress() -> str:
     labeled, needs_review, annotation_count = store.annotation_overview(DATASET_KEY)
     annotations, args = store.get_training_data(DATASET_KEY)
     predictions = store.prediction_rows(DATASET_KEY)
+    deleted_count = len(store.get_deleted_messages(DATASET_KEY))
     confirmed_ids = {a["mention_id"] for a in annotations}
     project_counts = Counter(a["project_id"] for a in annotations)
     score_counts = Counter(str(a["support_score"]) for a in annotations if a["support_score"] is not None)
@@ -354,6 +362,7 @@ def current_progress() -> str:
         f"- All message × project rows: **{annotation_count:,}** · **{len(needs_review):,}** messages pending review\n"
         f"- Confirmed argument rows eligible for training: **{len(args):,}**\n"
         f"- Model suggestion records: **{len(predictions):,}**\n"
+        f"- Removed from the active dataset: **{deleted_count:,}** (restorable below)\n"
         f"- Score counts: `{dict(score_counts)}`\n"
         f"- Project counts: `{dict(project_counts)}`"
     )
@@ -460,16 +469,6 @@ def refresh_dashboard(project_id, provenance, granularity, previous=None):
     return (revision, gr.update(choices=dashboard_projects()), coverage, *figures[1:])
 
 
-def sync_inputs(upload=None):
-    added, duplicates, errors = WORKFLOW.sync([upload] if upload else ())
-    status = f"Added **{added:,}** messages. Skipped **{duplicates:,}** duplicates. **{len(RECORDS):,}** messages available."
-    if errors:
-        status += "\n\n" + "\n".join(f"- {error}" for error in errors)
-    elif not upload and not any(path.is_file() for path in WORKFLOW._paths()):
-        status += "\n\nWaiting for a crawler JSON file. You can also upload one here."
-    return status, gr.update(choices=language_choices()), gr.update(choices=media_choices())
-
-
 def language_choices():
     return ["All languages", "French (all variants)", "German (all variants)"] + sorted({r["language_code"] for r in RECORDS})
 
@@ -478,25 +477,266 @@ def media_choices():
     return ["All media types"] + sorted({r["media_type_name"] for r in RECORDS})
 
 
+def source_format(record: dict[str, Any]) -> dict[str, Any]:
+    """Return one normalized record in the crawler's shareable JSON schema."""
+    return {
+        "mention_id": record.get("mention_id", ""),
+        "title": record.get("title", ""),
+        "published_at": record.get("published_at", ""),
+        "media_type_name": record.get("media_type_name", "unknown"),
+        "source_name": record.get("source_name", ""),
+        "language_code": record.get("language_code", "unknown"),
+        "url": record.get("url", ""),
+        "timestamp": record.get("timestamp") or record.get("published_at", ""),
+        "media_type": record.get("media_type") or record.get("media_type_name", "unknown"),
+        "source": record.get("source") or record.get("source_name", ""),
+        "language": record.get("language") or record.get("language_code", "unknown"),
+        "content": record.get("content", ""),
+        "sentiment": record.get("sentiment"),
+        "reach": record.get("reach"),
+        "engagements": record.get("engagements"),
+        "country_code": record.get("country_code", ""),
+    }
+
+
+def import_dataset_upload(upload) -> tuple[str, Any, Any]:
+    if not upload:
+        raise gr.Error("Choose a JSON dataset first.")
+    path = Path(upload)
+    if path.suffix.casefold() != ".json":
+        raise gr.Error("Upload a JSON file in the crawler's message format.")
+    try:
+        records = parse_upload(path.name, path.read_bytes())
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
+        raise gr.Error(f"Could not read this JSON dataset: {exc}") from exc
+    IMPORT_DIR.mkdir(parents=True, exist_ok=True)
+    saved_path = IMPORT_DIR / f"{datetime.now():%Y%m%d_%H%M%S}_{uuid.uuid4().hex[:8]}_{Path(path.name).name}"
+    shutil.copyfile(path, saved_path)
+    before_ids = set(WORKFLOW.by_id)
+    added, duplicates = WORKFLOW.add_records(records, saved_path.name)
+    _, pending = WORKFLOW.queue_ids()
+    global AUTO_REVIEW_AFTER_IMPORT
+    AUTO_REVIEW_AFTER_IMPORT = bool((set(WORKFLOW.by_id) - before_ids) & pending)
+    status = (f"Imported **{added:,}** messages; skipped **{duplicates:,}** duplicates. "
+              f"Dataset now has **{len(RECORDS):,}** active messages and **{len(pending):,}** items awaiting manual review. "
+              "Keyword rules assigned confident matches; unmatched or ambiguous records are in Manual labeling → Needs review.")
+    return status, gr.update(choices=language_choices()), gr.update(choices=media_choices())
+
+
+def add_manual_record(title, content, published_at, language_code, media_type_name, source_name, url, country_code):
+    if not (title or "").strip() and not (content or "").strip():
+        raise gr.Error("Enter a title or message content.")
+    record = {
+        "mention_id": f"manual:{uuid.uuid4().hex}",
+        "title": (title or "").strip(),
+        "content": (content or "").strip(),
+        "published_at": (published_at or "").strip(),
+        "timestamp": (published_at or "").strip(),
+        "language_code": (language_code or "unknown").strip() or "unknown",
+        "language": (language_code or "unknown").strip() or "unknown",
+        "media_type_name": (media_type_name or "unknown").strip() or "unknown",
+        "media_type": (media_type_name or "unknown").strip() or "unknown",
+        "source_name": (source_name or "").strip(),
+        "source": (source_name or "").strip(),
+        "url": (url or "").strip(),
+        "country_code": (country_code or "").strip(),
+    }
+    before_ids = set(WORKFLOW.by_id)
+    added, _ = WORKFLOW.add_records(normalize_records([record]), "manual-entry")
+    if not added:
+        raise gr.Error("This message already exists in the active dataset (or has been removed before).")
+    IMPORT_DIR.mkdir(parents=True, exist_ok=True)
+    manual_path = IMPORT_DIR / "manual_entries.json"
+    try:
+        existing = json.loads(manual_path.read_text("utf-8")) if manual_path.exists() else []
+        existing.append(source_format(record))
+        temporary = manual_path.with_suffix(".json.tmp")
+        temporary.write_text(json.dumps(existing, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        os.replace(temporary, manual_path)
+    except (OSError, json.JSONDecodeError):
+        logging.exception("Could not update manual-entry archive; SQLite row was saved")
+    _, pending = WORKFLOW.queue_ids()
+    global AUTO_REVIEW_AFTER_IMPORT
+    AUTO_REVIEW_AFTER_IMPORT = bool((set(WORKFLOW.by_id) - before_ids) & pending)
+    review_note = ("It is in the Needs review queue." if record["mention_id"] in pending
+                   else "Keyword rules assigned a suggestion; review it from the queue if needed.")
+    return (f"Added the message to the dataset. Total: **{len(RECORDS):,}**. {review_note}",
+            "", "", "", "", "", "", "", gr.update(choices=language_choices()), gr.update(choices=media_choices()))
+
+
+def export_combined_dataset() -> str:
+    EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+    path = EXPORT_DIR / f"seilbahn_dataset_{datetime.now():%Y%m%d_%H%M%S}.json"
+    path.write_text(json.dumps([source_format(record) for record in RECORDS], ensure_ascii=False, indent=2) + "\n",
+                    encoding="utf-8")
+    return str(path)
+
+
+def deleted_choices():
+    choices = []
+    for row in store.get_deleted_messages(DATASET_KEY):
+        record = json.loads(row["record_json"])
+        title = record.get("title") or record.get("content", "")[:80] or row["mention_id"]
+        choices.append((f"{title[:90]} · {row['mention_id']}", row["mention_id"]))
+    return choices
+
+
+def delete_current(state, reason, confirmed):
+    if not confirmed:
+        raise gr.Error("Check the confirmation box to remove this message from the active dataset.")
+    if not state or not state.get("ids"):
+        raise gr.Error("Load a message before removing it.")
+    mention_id = state["ids"][state["idx"]]
+    record = RECORD_BY_ID[mention_id]
+    store.delete_message(DATASET_KEY, mention_id, record, reason or "")
+    WORKFLOW.remove_record(mention_id)
+    state["ids"] = [item for item in state["ids"] if item != mention_id]
+    state["idx"] = min(state["idx"], max(0, len(state["ids"]) - 1))
+    return (*render_current(state, f"Removed `{mention_id}` from the active dataset. Its record and labels can be restored from Progress & export."), False, "")
+
+
+def restore_deleted(mention_id):
+    if not mention_id:
+        raise gr.Error("Select a removed message first.")
+    record = WORKFLOW.restore_record(mention_id)
+    if not record:
+        return "No matching deleted record found.", gr.update(choices=deleted_choices(), value=None)
+    global RECORD_BY_ID
+    RECORD_BY_ID = WORKFLOW.by_id
+    return f"Restored `{mention_id}` to the active dataset.", gr.update(choices=deleted_choices(), value=None)
+
+
+def open_import_review():
+    return gr.Tabs(selected="manual")
+
+
+def route_after_import():
+    global AUTO_REVIEW_AFTER_IMPORT
+    should_route = AUTO_REVIEW_AFTER_IMPORT
+    AUTO_REVIEW_AFTER_IMPORT = False
+    return gr.Tabs(selected="manual") if should_route else gr.skip()
+
+
+_CRAWLER_LOCK = Lock()
+_CRAWLER_STATE_LOCK = Lock()
+_CRAWLER_STATE = {"status": "Crawler has not run in this app session.", "last_run": ""}
+
+
+def run_crawler_once() -> str:
+    if not CRAWLER_SCRIPT.is_file():
+        message = f"Crawler script is missing: `{CRAWLER_SCRIPT}`"
+        with _CRAWLER_STATE_LOCK:
+            _CRAWLER_STATE["status"] = message
+        return message
+    if not _CRAWLER_LOCK.acquire(blocking=False):
+        return "A crawler run is already in progress."
+    started = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M %Z")
+    with _CRAWLER_STATE_LOCK:
+        _CRAWLER_STATE.update(status=f"Crawler running (started {started})…", last_run=started)
+    try:
+        CRAWLER_OUTPUT.parent.mkdir(parents=True, exist_ok=True)
+        result = subprocess.run(
+            [sys.executable, str(CRAWLER_SCRIPT), "--output", str(CRAWLER_OUTPUT)],
+            cwd=APP_DIR, text=True, capture_output=True, timeout=900,
+        )
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "Crawler exited with an error.")[-3500:]
+            message = f"Crawler failed. Check that crawler dependencies are installed.\n\n```\n{detail}\n```"
+        else:
+            added, duplicates, errors = WORKFLOW.sync()
+            _, pending = WORKFLOW.queue_ids()
+            message = (f"Crawler finished at {datetime.now().astimezone():%Y-%m-%d %H:%M %Z}. "
+                       f"Added **{added:,}** new messages; skipped **{duplicates:,}** duplicates. "
+                       f"Active dataset: **{len(RECORDS):,}** messages; **{len(pending):,}** await manual review.")
+            if errors:
+                message += "\n\n" + "\n".join(f"- {error}" for error in errors)
+        with _CRAWLER_STATE_LOCK:
+            _CRAWLER_STATE["status"] = message
+        return message
+    except Exception as exc:
+        message = f"Crawler could not complete: {exc}"
+        with _CRAWLER_STATE_LOCK:
+            _CRAWLER_STATE["status"] = message
+        return message
+    finally:
+        _CRAWLER_LOCK.release()
+
+
+def run_crawler_from_ui() -> str:
+    before_ids = set(WORKFLOW.by_id)
+    status = run_crawler_once()
+    _, pending = WORKFLOW.queue_ids()
+    global AUTO_REVIEW_AFTER_IMPORT
+    AUTO_REVIEW_AFTER_IMPORT = bool((set(WORKFLOW.by_id) - before_ids) & pending)
+    return status
+
+
+def automatic_crawler_loop(stop: Event):
+    if os.getenv("SEILBAHN_DISABLE_CRAWLER", "0").casefold() in {"1", "true", "yes"}:
+        with _CRAWLER_STATE_LOCK:
+            _CRAWLER_STATE["status"] = "Automatic crawler disabled by `SEILBAHN_DISABLE_CRAWLER`."
+        return
+    try:
+        interval = max(300, int(os.getenv("SEILBAHN_CRAWL_INTERVAL_SECONDS", "21600")))
+    except ValueError:
+        interval = 21600
+    while not stop.is_set():
+        run_crawler_once()
+        if stop.wait(interval):
+            break
+
+
+def current_crawler_status():
+    with _CRAWLER_STATE_LOCK:
+        status = _CRAWLER_STATE["status"]
+    try:
+        interval_hours = max(300, int(os.getenv("SEILBAHN_CRAWL_INTERVAL_SECONDS", "21600"))) / 3600
+    except ValueError:
+        interval_hours = 6
+    return f"{status}\n\nAutomatic schedule: every {interval_hours:g} hours while the Seilbahn app is running."
+
+
+def refresh_import_status(upload=None):
+    if upload:
+        return import_dataset_upload(upload)
+    before_ids = set(WORKFLOW.by_id)
+    added, duplicates, errors = WORKFLOW.sync()
+    _, pending = WORKFLOW.queue_ids()
+    global AUTO_REVIEW_AFTER_IMPORT
+    AUTO_REVIEW_AFTER_IMPORT = bool((set(WORKFLOW.by_id) - before_ids) & pending)
+    status = current_crawler_status()
+    if added or duplicates:
+        status += f"\n\nNew file scan: added {added:,}; skipped {duplicates:,} duplicates."
+    if errors:
+        status += "\n\n" + "\n".join(f"- {error}" for error in errors)
+    return status, gr.update(choices=language_choices()), gr.update(choices=media_choices())
+
+
 store.initialize()
 DEFAULT_DATASET = find_default_dataset()
-if DEFAULT_DATASET is None:
-    raise FileNotFoundError("Default dataset not found; place the app under the FCH26 project or edit DEFAULT_DATASET in app.py.")
-with open(DEFAULT_DATASET, "r", encoding="utf-8-sig") as _handle:
-    RECORDS = normalize_records(json.load(_handle))
-DATASET_KEY = fingerprint(RECORDS)
+if DEFAULT_DATASET and DEFAULT_DATASET.is_file():
+    with open(DEFAULT_DATASET, "r", encoding="utf-8-sig") as _handle:
+        BASE_RECORDS = normalize_records(json.load(_handle))
+    proposed_dataset_key = fingerprint(BASE_RECORDS)
+else:
+    BASE_RECORDS = []
+    proposed_dataset_key = hashlib.sha256(b"seilbahn-empty-workspace-v1").hexdigest()
+DATASET_KEY = store.get_or_set_dataset_key(proposed_dataset_key)
+deleted_on_start = store.deleted_message_ids(DATASET_KEY)
+RECORDS = [row for row in BASE_RECORDS if row["mention_id"] not in deleted_on_start]
 WORKFLOW = Workflow(DATASET_KEY, RECORDS, parse_upload, ROOT_DIR)
 WORKFLOW.sync()
 RECORD_BY_ID = WORKFLOW.by_id
+AUTO_REVIEW_AFTER_IMPORT = False
 PROJECT_NAMES = {p["project_id"]: p["project_name"] for p in store.list_projects()}
 QUEUE_NAMES = ["Needs review", "Unlabeled", "Labeled", "All"]
 PROJECT_FILTERS = ["All projects"] + [p["project_name"] for p in store.list_projects() if not p["is_special"]]
 
 
-with gr.Blocks(title="Cable Car Debate Atlas", theme=gr.themes.Soft(primary_hue="teal")) as demo:
+with gr.Blocks(title="Seilbahn", theme=gr.themes.Soft(primary_hue="teal")) as demo:
     gr.Markdown(
-        "# Cable Car Debate Atlas\n"
-        "Explore how projects are discussed in the source dataset and incoming coverage."
+        "# Seilbahn\n"
+        "Explore how cable-car projects are discussed across the dataset and incoming coverage."
     )
     with gr.Tabs() as tabs:
         with gr.Tab("Overview", id="overview"):
@@ -551,6 +791,10 @@ with gr.Blocks(title="Cable Car Debate Atlas", theme=gr.themes.Soft(primary_hue=
                     with gr.Row():
                         save_button = gr.Button("Save", variant="primary")
                         save_next_button = gr.Button("Save & next")
+                    with gr.Accordion("Remove an empty or irrelevant message", open=False):
+                        delete_reason = gr.Textbox(label="Reason (optional)", placeholder="Empty text, duplicate, unrelated, …")
+                        confirm_delete = gr.Checkbox(label="I confirm removing this record from the active dataset", value=False)
+                        delete_button = gr.Button("Remove this message", variant="stop")
             view_outputs = [queue_state, title, content, metadata, position, project, other_project_name,
                             stance_status, support_score, argument_types, direction, evidence_quote,
                             argument_summary, notes, needs_review, suggestions, notice, edit_project]
@@ -562,6 +806,8 @@ with gr.Blocks(title="Cable Car Debate Atlas", theme=gr.themes.Soft(primary_hue=
                            argument_types, direction, evidence_quote, argument_summary, annotator, notes, needs_review]
             save_event = save_button.click(lambda *xs: save_current(*xs, advance=False), save_inputs, view_outputs)
             save_next_event = save_next_button.click(lambda *xs: save_current(*xs, advance=True), save_inputs, view_outputs)
+            delete_event = delete_button.click(delete_current, [queue_state, delete_reason, confirm_delete],
+                                               [*view_outputs, confirm_delete, delete_reason])
             open_queue.click(lambda: gr.Tabs(selected="manual"), outputs=tabs).then(
                 build_queue, [queue, language, media, search, project_filter], view_outputs,
             )
@@ -569,13 +815,52 @@ with gr.Blocks(title="Cable Car Debate Atlas", theme=gr.themes.Soft(primary_hue=
                               outputs=[language, media])
             demo.load(lambda: build_queue("Needs review", "All languages", "All media types", "", "All projects"), None, view_outputs)
 
-        with gr.Tab("Crawler import"):
-            gr.Markdown("Drop the crawler's JSON here or place it at the configured crawler output path. New files at that path are picked up automatically.")
-            crawler_file = gr.File(label="Crawler JSON", file_types=[".json"], type="filepath")
-            with gr.Row():
-                upload_import = gr.Button("Import uploaded JSON", variant="primary")
-                scan_import = gr.Button("Check crawler output now")
-            import_status = gr.Markdown("Crawler output is checked every 15 seconds while the app is running.")
+        with gr.Tab("Datasets & crawler"):
+            gr.Markdown("Upload a crawler-format JSON dataset, add records individually, or let Seilbahn run the bundled crawler in the background. Imported records are keyword-labeled and saved to the same SQLite-backed dataset.")
+            with gr.Accordion("Automatic crawler", open=True):
+                crawler_status = gr.Markdown(current_crawler_status())
+                with gr.Row():
+                    run_crawler_button = gr.Button("Run crawler now", variant="primary")
+                    scan_import = gr.Button("Scan crawler output")
+                    review_pending_button = gr.Button("Open manual review queue")
+            with gr.Accordion("Import a JSON dataset", open=True):
+                gr.Markdown("Expected format: a JSON array of messages. Standard keys include `mention_id`, `title`, `published_at`, `media_type_name`, `source_name`, `language_code`, `url`, and `content`. The app also accepts crawler aliases `timestamp`, `media_type`, `source`, and `language`.")
+                crawler_file = gr.File(label="Dataset JSON", file_types=[".json"], type="filepath")
+                upload_import = gr.Button("Import JSON into Seilbahn", variant="primary")
+            with gr.Accordion("Add one record manually", open=False):
+                with gr.Row():
+                    manual_title = gr.Textbox(label="Title")
+                    manual_date = gr.Textbox(label="Published date / timestamp", placeholder="2026-11-14 or ISO timestamp")
+                manual_content = gr.Textbox(label="Content", lines=7)
+                with gr.Row():
+                    manual_language = gr.Textbox(label="Language code", value="unknown")
+                    manual_media = gr.Textbox(label="Media type", value="manual")
+                    manual_source = gr.Textbox(label="Source name")
+                with gr.Row():
+                    manual_url = gr.Textbox(label="Source URL")
+                    manual_country = gr.Textbox(label="Country code")
+                add_manual_button = gr.Button("Add message to dataset", variant="primary")
+            import_status = gr.Markdown("Ready. The active dataset is stored in the Seilbahn workspace database.")
+            manual_add_event = add_manual_button.click(
+                add_manual_record,
+                [manual_title, manual_content, manual_date, manual_language, manual_media, manual_source, manual_url, manual_country],
+                [import_status, manual_title, manual_content, manual_date, manual_language, manual_media, manual_source,
+                 manual_url, manual_country, language, media],
+            )
+            crawler_event = run_crawler_button.click(run_crawler_from_ui, None, crawler_status).success(
+                refresh_dashboard, dashboard_inputs, dashboard_outputs)
+            crawler_event.success(route_after_import, None, tabs).then(
+                build_queue, [queue, language, media, search, project_filter], view_outputs)
+            scan_event = scan_import.click(refresh_import_status, None, [crawler_status, language, media]).success(
+                refresh_dashboard, dashboard_inputs, dashboard_outputs)
+            scan_event.success(route_after_import, None, tabs).then(
+                build_queue, [queue, language, media, search, project_filter], view_outputs)
+            upload_event = upload_import.click(import_dataset_upload, crawler_file, [import_status, language, media]).success(
+                refresh_dashboard, dashboard_inputs, dashboard_outputs)
+            upload_event.success(route_after_import, None, tabs).then(
+                build_queue, [queue, language, media, search, project_filter], view_outputs)
+            review_pending_button.click(open_import_review, None, tabs).then(
+                build_queue, [queue, language, media, search, project_filter], view_outputs)
 
         with gr.Tab("Model tools"):
             gr.Markdown("### Train on saved human labels\nThe local baseline uses TF-IDF + scikit-learn. It runs without an API key or pretrained model download. Predictions are suggestions and never overwrite human labels.")
@@ -604,12 +889,21 @@ with gr.Blocks(title="Cable Car Debate Atlas", theme=gr.themes.Soft(primary_hue=
                 rag_file = gr.File(label="RAG-ready JSONL")
                 preds_file = gr.File(label="Model suggestions CSV")
                 sqlite_file = gr.File(label="Consistent SQLite backup (for SFTP)")
+                combined_file = gr.File(label="Combined active dataset JSON")
             with gr.Row():
                 gr.Button("Export labels CSV").click(lambda: export_file("labels_csv"), None, labels_file)
                 gr.Button("Export arguments CSV").click(lambda: export_file("arguments_csv"), None, args_file)
                 gr.Button("Export RAG JSONL").click(lambda: export_file("rag_jsonl"), None, rag_file)
                 gr.Button("Export predictions CSV").click(lambda: export_file("predictions_csv"), None, preds_file)
                 gr.Button("Create SQLite backup").click(lambda: export_file("sqlite_backup"), None, sqlite_file)
+                gr.Button("Export active dataset JSON").click(export_combined_dataset, None, combined_file)
+            gr.Markdown("### Restore removed records")
+            with gr.Row():
+                deleted_message = gr.Dropdown(choices=deleted_choices(), label="Removed messages", scale=5)
+                restore_button = gr.Button("Restore selected message")
+            restore_status = gr.Markdown()
+            restore_event = restore_button.click(restore_deleted, deleted_message, [restore_status, deleted_message])
+            restore_event.success(lambda: current_progress(), None, progress)
             gr.Markdown(f"SQLite database: `{store.DB_PATH}`\n\nModel files: `{APP_DIR / 'models'}`")
 
         with gr.Tab("Guide & taxonomy"):
@@ -631,7 +925,7 @@ The local model is a quick baseline, not a validated production classifier. It r
 `Argument abstraction` is currently a human-reviewed short paraphrase linked to the original quote. Automatic abstraction is a separate text-generation task and needs examples of verified quote → faithful summary → argument type/direction. The app does not generate summaries automatically.
 
 ### Data boundary
-The app runs on `127.0.0.1`; it does not publish data or call a remote LLM. The original dataset remains in its JSON file. SQLite stores labels and predictions. CSV/JSONL exports are generated under the app's `data/exports` folder.
+The app binds to `127.0.0.1` by default and does not call a remote LLM. The crawler fetches public web pages and search feeds when enabled. The combined message dataset, imported records, labels, removal history, and predictions are stored locally in SQLite; JSON/CSV/JSONL exports are generated under `data/exports`.
 """)
             with gr.Row():
                 new_project = gr.Textbox(label="Add a project to the index")
@@ -652,10 +946,15 @@ The app runs on `127.0.0.1`; it does not publish data or call a remote LLM. The 
         control.input(refresh_dashboard, dashboard_inputs, dashboard_outputs)
     for event in (save_event, save_next_event):
         event.success(refresh_dashboard, dashboard_inputs, dashboard_outputs)
-    import_outputs = [import_status, language, media]
-    upload_import.click(sync_inputs, crawler_file, import_outputs).success(refresh_dashboard, dashboard_inputs, dashboard_outputs)
-    scan_import.click(sync_inputs, None, import_outputs).success(refresh_dashboard, dashboard_inputs, dashboard_outputs)
+    manual_add_event.success(refresh_dashboard, dashboard_inputs, dashboard_outputs)
+    manual_add_event.success(route_after_import, None, tabs).then(
+        build_queue, [queue, language, media, search, project_filter], view_outputs)
+    delete_event.success(lambda: (current_progress(), gr.update(choices=deleted_choices())),
+                         None, [progress, deleted_message]).success(
+        refresh_dashboard, dashboard_inputs, dashboard_outputs)
+    restore_event.success(refresh_dashboard, dashboard_inputs, dashboard_outputs)
     gr.Timer(15).tick(refresh_dashboard, dashboard_inputs, dashboard_outputs, show_progress="hidden")
+    gr.Timer(15).tick(lambda: current_crawler_status(), None, crawler_status, show_progress="hidden")
 
 
 def watch_crawler(stop):
@@ -676,6 +975,7 @@ if __name__ == "__main__":
     app_auth = (username, password) if username and password else None
     stop = Event()
     Thread(target=watch_crawler, args=(stop,), daemon=True).start()
+    Thread(target=automatic_crawler_loop, args=(stop,), daemon=True).start()
     try:
         demo.queue(default_concurrency_limit=1).launch(
             server_name=host, server_port=port, auth=app_auth, share=False, show_error=True,
