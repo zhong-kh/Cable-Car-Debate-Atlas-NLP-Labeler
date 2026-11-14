@@ -52,6 +52,8 @@ python -m pip install -r requirements.txt
 python app.py
 ```
 
+The requirements keep `huggingface-hub` below 1.0 to match Gradio 4.x, which imports the `HfFolder` API removed in Hub 1.0.
+
 Open <http://127.0.0.1:7861>. The app can start without the original source corpus. Import a JSON dataset in **Datasets & crawler**, or set `LABELER_SOURCE_PATH` before starting the app. If the original source is available next to the repository in `../Participants - Future City Hackathon/Stadt Heilbronn/`, the app will find the Heilbronn JSON automatically on its first run.
 
 For local settings, copy the example and export its values into the shell before starting the app:
