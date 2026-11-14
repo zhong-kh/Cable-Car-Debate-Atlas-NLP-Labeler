@@ -753,6 +753,10 @@ with gr.Blocks(title="Seilbahn", theme=gr.themes.Soft(primary_hue="teal")) as de
             time_plot = gr.Plot()
             source_plot = gr.Plot()
 
+        dashboard_revision = gr.State()
+        dashboard_inputs = [chart_project, chart_origin, chart_period, dashboard_revision]
+        dashboard_outputs = [dashboard_revision, chart_project, coverage, topic_plot, argument_plot, time_plot, source_plot]
+
         with gr.Tab("Manual labeling", id="manual") as manual_tab:
             queue_state = gr.State({"ids": [], "idx": 0})
             with gr.Row():
@@ -938,9 +942,6 @@ The app binds to `127.0.0.1` by default and does not call a remote LLM. The craw
                 taxonomy_status = gr.Markdown()
             add_argument_button.click(add_argument_category, new_argument, [taxonomy_status, argument_types])
 
-    dashboard_revision = gr.State()
-    dashboard_inputs = [chart_project, chart_origin, chart_period, dashboard_revision]
-    dashboard_outputs = [dashboard_revision, chart_project, coverage, topic_plot, argument_plot, time_plot, source_plot]
     demo.load(refresh_dashboard, dashboard_inputs, dashboard_outputs)
     for control in (chart_project, chart_origin, chart_period):
         control.input(refresh_dashboard, dashboard_inputs, dashboard_outputs)
