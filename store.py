@@ -1,0 +1,343 @@
+"""SQLite persistence for the local cable-car annotation workbench."""
+
+from __future__ import annotations
+
+import re
+import sqlite3
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+
+APP_DIR = Path(__file__).resolve().parent
+DATA_DIR = APP_DIR / "data"
+DB_PATH = DATA_DIR / "annotations.sqlite3"
+
+PROJECTS = [
+    ("heilbronn_cable_car", "Heilbronn Cable Car", 0),
+    ("bonn_cable_car", "Bonn Cable Car", 0),
+    ("passau_oberhaus_cable_car", "Passau Oberhaus Cable Car", 0),
+    ("__general__", "General cable-car topic / no single project", 1),
+    ("__other_named__", "Other named cable-car project (enter its name)", 1),
+    ("__unclear__", "Unclear project / needs review", 1),
+    ("__unrelated__", "Unrelated to a cable-car proposal", 1),
+]
+
+ARGUMENTS = [
+    ("cost_finance", "Cost / funding / opportunity cost"),
+    ("time_convenience", "Travel time / convenience"),
+    ("accessibility_connectivity", "Accessibility / network connections"),
+    ("capacity_reliability", "Capacity / reliability"),
+    ("climate_emissions", "Climate / emissions"),
+    ("nature_landscape", "Nature / landscape / trees"),
+    ("noise_vibration", "Noise / vibration"),
+    ("privacy_visual", "Privacy / visual impact"),
+    ("economic_development", "Economic growth / jobs / tourism"),
+    ("equity_distribution", "Equity / who benefits or bears the impact"),
+    ("safety", "Safety"),
+    ("construction_disruption", "Construction disruption"),
+    ("governance_participation", "Governance / transparency / participation"),
+    ("technical_feasibility", "Technical / operational feasibility"),
+    ("other", "Other argument"),
+]
+
+
+def connect() -> sqlite3.Connection:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(DB_PATH, timeout=30)
+    con.row_factory = sqlite3.Row
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("PRAGMA foreign_keys=ON")
+    return con
+
+
+@contextmanager
+def db_session():
+    con = connect()
+    try:
+        yield con
+        con.commit()
+    except Exception:
+        con.rollback()
+        raise
+    finally:
+        con.close()
+
+
+def initialize() -> None:
+    with db_session() as con:
+        con.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS projects (
+                project_id TEXT PRIMARY KEY,
+                project_name TEXT NOT NULL UNIQUE,
+                is_special INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS argument_classes (
+                class_code TEXT PRIMARY KEY,
+                class_name TEXT NOT NULL UNIQUE,
+                is_active INTEGER NOT NULL DEFAULT 1
+            );
+            CREATE TABLE IF NOT EXISTS annotations (
+                dataset_key TEXT NOT NULL,
+                mention_id TEXT NOT NULL,
+                project_id TEXT NOT NULL,
+                relevance TEXT NOT NULL,
+                stance_status TEXT NOT NULL,
+                support_score INTEGER,
+                other_project_name TEXT,
+                annotator TEXT NOT NULL DEFAULT '',
+                notes TEXT NOT NULL DEFAULT '',
+                needs_review INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (dataset_key, mention_id, project_id),
+                FOREIGN KEY(project_id) REFERENCES projects(project_id)
+            );
+            CREATE TABLE IF NOT EXISTS argument_labels (
+                dataset_key TEXT NOT NULL,
+                mention_id TEXT NOT NULL,
+                project_id TEXT NOT NULL,
+                class_code TEXT NOT NULL,
+                direction TEXT NOT NULL,
+                evidence_quote TEXT NOT NULL DEFAULT '',
+                argument_summary TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (dataset_key, mention_id, project_id, class_code),
+                FOREIGN KEY(project_id) REFERENCES projects(project_id),
+                FOREIGN KEY(class_code) REFERENCES argument_classes(class_code)
+            );
+            CREATE TABLE IF NOT EXISTS predictions (
+                dataset_key TEXT NOT NULL,
+                mention_id TEXT NOT NULL,
+                task TEXT NOT NULL,
+                project_id TEXT NOT NULL DEFAULT '',
+                result_json TEXT NOT NULL,
+                confidence REAL,
+                review_required INTEGER NOT NULL DEFAULT 1,
+                model_version TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY(dataset_key, mention_id, task, project_id)
+            );
+            CREATE TABLE IF NOT EXISTS model_runs (
+                dataset_key TEXT NOT NULL,
+                model_version TEXT NOT NULL,
+                model_path TEXT NOT NULL,
+                trained_at TEXT NOT NULL,
+                summary_json TEXT NOT NULL,
+                PRIMARY KEY(dataset_key, model_version)
+            );
+            """
+        )
+        for project_id, name, special in PROJECTS:
+            con.execute(
+                "INSERT OR IGNORE INTO projects(project_id, project_name, is_special) VALUES (?, ?, ?)",
+                (project_id, name, special),
+            )
+        for code, name in ARGUMENTS:
+            con.execute(
+                "INSERT OR IGNORE INTO argument_classes(class_code, class_name) VALUES (?, ?)",
+                (code, name),
+            )
+
+
+def list_projects() -> list[dict[str, Any]]:
+    with db_session() as con:
+        return [dict(r) for r in con.execute("SELECT * FROM projects ORDER BY is_special, project_name")]
+
+
+def list_argument_classes() -> list[dict[str, Any]]:
+    with db_session() as con:
+        return [dict(r) for r in con.execute("SELECT * FROM argument_classes WHERE is_active=1 ORDER BY class_name")]
+
+
+def _slug(value: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "_", value.casefold()).strip("_")
+    return slug or "project"
+
+
+def add_project(name: str) -> str:
+    name = name.strip()
+    if not name:
+        raise ValueError("Project name cannot be empty")
+    with db_session() as con:
+        existing = con.execute("SELECT project_id FROM projects WHERE project_name=?", (name,)).fetchone()
+        if existing:
+            return str(existing["project_id"])
+        base = _slug(name)
+        candidate = base
+        suffix = 2
+        while con.execute("SELECT 1 FROM projects WHERE project_id=?", (candidate,)).fetchone():
+            candidate = f"{base}_{suffix}"
+            suffix += 1
+        con.execute("INSERT INTO projects(project_id, project_name, is_special) VALUES (?, ?, 0)", (candidate, name))
+        return candidate
+
+
+def add_argument_class(name: str) -> str:
+    name = name.strip()
+    if not name:
+        raise ValueError("Argument name cannot be empty")
+    with db_session() as con:
+        existing = con.execute("SELECT class_code FROM argument_classes WHERE class_name=?", (name,)).fetchone()
+        if existing:
+            return str(existing["class_code"])
+        base = _slug(name)
+        candidate = base
+        suffix = 2
+        while con.execute("SELECT 1 FROM argument_classes WHERE class_code=?", (candidate,)).fetchone():
+            candidate = f"{base}_{suffix}"
+            suffix += 1
+        con.execute("INSERT INTO argument_classes(class_code, class_name) VALUES (?, ?)", (candidate, name))
+        return candidate
+
+
+def get_annotation(dataset_key: str, mention_id: str, project_id: str) -> dict[str, Any] | None:
+    with db_session() as con:
+        row = con.execute(
+            "SELECT * FROM annotations WHERE dataset_key=? AND mention_id=? AND project_id=?",
+            (dataset_key, mention_id, project_id),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def get_annotations_for_message(dataset_key: str, mention_id: str) -> list[dict[str, Any]]:
+    with db_session() as con:
+        rows = con.execute(
+            "SELECT a.*, p.project_name FROM annotations a JOIN projects p USING(project_id) "
+            "WHERE dataset_key=? AND mention_id=? ORDER BY a.updated_at DESC",
+            (dataset_key, mention_id),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_arguments_for_annotation(dataset_key: str, mention_id: str, project_id: str) -> list[dict[str, Any]]:
+    with db_session() as con:
+        rows = con.execute(
+            "SELECT al.*, ac.class_name FROM argument_labels al JOIN argument_classes ac USING(class_code) "
+            "WHERE dataset_key=? AND mention_id=? AND project_id=? ORDER BY ac.class_name",
+            (dataset_key, mention_id, project_id),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def save_annotation(data: dict[str, Any], arguments: list[dict[str, Any]]) -> None:
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with db_session() as con:
+        con.execute(
+            """INSERT INTO annotations(
+                dataset_key, mention_id, project_id, relevance, stance_status, support_score,
+                other_project_name, annotator, notes, needs_review, updated_at
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(dataset_key, mention_id, project_id) DO UPDATE SET
+                relevance=excluded.relevance, stance_status=excluded.stance_status,
+                support_score=excluded.support_score, other_project_name=excluded.other_project_name,
+                annotator=excluded.annotator, notes=excluded.notes, needs_review=excluded.needs_review,
+                updated_at=excluded.updated_at""",
+            (
+                data["dataset_key"], data["mention_id"], data["project_id"], data["relevance"],
+                data["stance_status"], data["support_score"], data.get("other_project_name"),
+                data.get("annotator", ""), data.get("notes", ""), int(data.get("needs_review", False)), now,
+            ),
+        )
+        con.execute(
+            "DELETE FROM argument_labels WHERE dataset_key=? AND mention_id=? AND project_id=?",
+            (data["dataset_key"], data["mention_id"], data["project_id"]),
+        )
+        for arg in arguments:
+            con.execute(
+                """INSERT INTO argument_labels(
+                    dataset_key, mention_id, project_id, class_code, direction, evidence_quote, argument_summary
+                ) VALUES(?,?,?,?,?,?,?)""",
+                (
+                    data["dataset_key"], data["mention_id"], data["project_id"], arg["class_code"],
+                    arg.get("direction", "unclear"), arg.get("evidence_quote", ""), arg.get("argument_summary", ""),
+                ),
+            )
+
+
+def annotation_overview(dataset_key: str) -> tuple[set[str], set[str], int]:
+    with db_session() as con:
+        rows = con.execute(
+            "SELECT mention_id, needs_review FROM annotations WHERE dataset_key=?", (dataset_key,)
+        ).fetchall()
+        labeled = {str(r["mention_id"]) for r in rows}
+        review = {str(r["mention_id"]) for r in rows if r["needs_review"]}
+        return labeled, review, len(rows)
+
+
+def get_training_data(dataset_key: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    with db_session() as con:
+        annotations = [dict(r) for r in con.execute(
+            "SELECT * FROM annotations WHERE dataset_key=? ORDER BY mention_id, project_id", (dataset_key,)
+        )]
+        arguments = [dict(r) for r in con.execute(
+            "SELECT * FROM argument_labels WHERE dataset_key=? ORDER BY mention_id, project_id, class_code", (dataset_key,)
+        )]
+    return annotations, arguments
+
+
+def save_model_run(dataset_key: str, model_version: str, model_path: str, summary_json: str) -> None:
+    with db_session() as con:
+        con.execute(
+            "INSERT OR REPLACE INTO model_runs VALUES(?,?,?,?,?)",
+            (dataset_key, model_version, model_path, datetime.now(timezone.utc).isoformat(timespec="seconds"), summary_json),
+        )
+
+
+def save_predictions(dataset_key: str, model_version: str, rows: list[dict[str, Any]]) -> None:
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with db_session() as con:
+        con.execute("DELETE FROM predictions WHERE dataset_key=?", (dataset_key,))
+        con.executemany(
+            """INSERT INTO predictions(
+                dataset_key, mention_id, task, project_id, result_json, confidence,
+                review_required, model_version, created_at
+            ) VALUES(?,?,?,?,?,?,?,?,?)""",
+            [
+                (dataset_key, r["mention_id"], r["task"], r.get("project_id", ""), r["result_json"],
+                 r.get("confidence"), int(r.get("review_required", True)), model_version, now)
+                for r in rows
+            ],
+        )
+
+
+def predictions_for_message(dataset_key: str, mention_id: str) -> list[dict[str, Any]]:
+    with db_session() as con:
+        return [dict(r) for r in con.execute(
+            "SELECT * FROM predictions WHERE dataset_key=? AND mention_id=? ORDER BY task, project_id",
+            (dataset_key, mention_id),
+        )]
+
+
+def prediction_rows(dataset_key: str) -> list[dict[str, Any]]:
+    with db_session() as con:
+        return [dict(r) for r in con.execute(
+            "SELECT * FROM predictions WHERE dataset_key=? ORDER BY mention_id, task, project_id",
+            (dataset_key,),
+        )]
+
+
+def backup_database(destination: str | Path) -> None:
+    """Create a consistent SQLite snapshot, including committed WAL contents."""
+    source = connect()
+    target = sqlite3.connect(str(destination), timeout=30)
+    try:
+        source.backup(target)
+    finally:
+        target.close()
+        source.close()
+
+
+def export_rows(dataset_key: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    with db_session() as con:
+        labels = [dict(r) for r in con.execute(
+            """SELECT a.*, p.project_name FROM annotations a JOIN projects p USING(project_id)
+               WHERE dataset_key=? ORDER BY mention_id, project_id""", (dataset_key,)
+        )]
+        args = [dict(r) for r in con.execute(
+            """SELECT al.*, ac.class_name, p.project_name FROM argument_labels al
+               JOIN argument_classes ac USING(class_code) JOIN projects p USING(project_id)
+               WHERE dataset_key=? ORDER BY mention_id, project_id, class_code""", (dataset_key,)
+        )]
+    return labels, args
+
